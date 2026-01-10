@@ -1,0 +1,56 @@
+name: Hourly 1H Scan
+
+on:
+  schedule:
+    - cron: "10 * * * *"  # every hour at minute 10 UTC
+  workflow_dispatch: {}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write Google service account json
+        run: |
+          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT }}' > service_account.json
+
+      - name: Run hourly scan
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ./service_account.json
+
+          # Alpaca keys are not required for hourly scan, but safe to include
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          ALPACA_PAPER: "true"
+
+          UNIVERSE_STATIC_FILE: ./universe_static.csv
+          MAX_UNIVERSE_TICKERS: "1200"
+
+          YF_BATCH_SIZE: "80"
+          YF_SLEEP_BETWEEN_BATCH_SEC: "2"
+
+          CANDIDATE_TTL_MINUTES: "180"
+
+          TOUCH_BUFFER_ATR_MULT: "0.10"
+          STOP_BUFFER_ATR_MULT: "0.15"
+          CONFIRM_BREAK_BUFFER_ATR_MULT: "0.05"
+
+          RISK_PER_TRADE_USD: "25"
+          TAKE_PROFIT_R_MULT: "2.0"
+
+          TIMEZONE: "America/New_York"
+          LOG_LEVEL: "INFO"
+        run: |
+          python -m src.main_hourly_scan
