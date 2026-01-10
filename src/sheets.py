@@ -36,3 +36,35 @@ def clear_and_write(ws, headers: List[str], df: pd.DataFrame):
 def append_rows(ws, rows: List[List[Any]]):
     if rows:
         ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+def read_worksheet_df(ws) -> pd.DataFrame:
+    """
+    Reads entire worksheet into a DataFrame using the first row as headers.
+    Returns empty DF if sheet is empty.
+    """
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return pd.DataFrame()
+    headers = values[0]
+    rows = values[1:]
+    df = pd.DataFrame(rows, columns=headers)
+    return df
+
+def append_df(ws, df: pd.DataFrame, headers: List[str]):
+    """
+    Appends a dataframe to a worksheet. If worksheet is empty, writes headers first.
+    """
+    if ws.row_values(1) == []:
+        ws.update("A1", [headers])
+
+    if df is None or df.empty:
+        return
+
+    # Ensure correct col order + convert NaNs to empty
+    df2 = df.copy()
+    for h in headers:
+        if h not in df2.columns:
+            df2[h] = ""
+    df2 = df2[headers].fillna("")
+    ws.append_rows(df2.values.tolist(), value_input_option="USER_ENTERED")
+
