@@ -43,7 +43,12 @@ def utc_iso_z() -> str:
 
 def _safe_float(x, default=0.0) -> float:
     try:
-        return float(x)
+        if x is None:
+            return float(default)
+        s = str(x).strip()
+        if s == "" or s.lower() == "nan":
+            return float(default)
+        return float(s)
     except Exception:
         return float(default)
 
@@ -54,6 +59,7 @@ def _read_control_kv(ss) -> dict:
     if df is None or df.empty:
         return {}
 
+    # tolerate column naming
     key_col = None
     val_col = None
     for c in df.columns:
@@ -81,7 +87,7 @@ def _knobs(cfg: Config, control: dict) -> dict:
 
     def i(key: str, default: int) -> int:
         try:
-            return int(float(control.get(key, default)))
+            return int(float(str(control.get(key, default)).strip()))
         except Exception:
             return int(default)
 
@@ -91,7 +97,8 @@ def _knobs(cfg: Config, control: dict) -> dict:
         "max_concurrent_trades": i("max_concurrent_trades", 2),
         "risk_per_trade_usd": f("risk_per_trade_usd", getattr(cfg, "risk_per_trade_usd", 25.0)),
         "take_profit_r_mult": f("take_profit_r_mult", getattr(cfg, "take_profit_r_mult", 2.0)),
-        "est_txn_cost_rate": f("est_txn_cost_rate", 0.005),
+        # IMPORTANT: realistic default (0.05% round-trip). You can override in Control.
+        "est_txn_cost_rate": f("est_txn_cost_rate", 0.0005),
         "min_expected_net_r": f("min_expected_net_r", 1.2),
         "auto_select": str(control.get("auto_select", "TRUE")).strip().upper() in ("TRUE", "YES", "1", "Y"),
         "mode": str(control.get("mode", "PAPER")).strip().upper(),
@@ -119,12 +126,12 @@ def select_trades():
         ws_logs.append_rows([[utc_iso_z(), "select_trades", "INFO", msg]])
         return
 
-    # Ensure all columns exist
+    # Ensure all columns exist in df
     for c in TRADE_HEADERS:
         if c not in df.columns:
             df[c] = ""
 
-    # Only consider NEW trades (not already executed)
+    # Normalize status column
     df["status"] = df["status"].astype(str).str.upper().str.strip()
     candidates = df[df["status"] == "NEW"].copy()
 
@@ -132,22 +139,16 @@ def select_trades():
         msg = "No NEW trades to select."
         logger.info(msg)
         ws_logs.append_rows([[utc_iso_z(), "select_trades", "INFO", msg]])
-        # Still write back normalized columns
         df = df[TRADE_HEADERS]
         clear_and_write(ws_trades, TRADE_HEADERS, df)
         return
 
-    # Compute sizing fresh from Control (this is the control center)
-    # and compute cost-aware net R and score.
     scored_rows = []
 
     for idx, r in candidates.iterrows():
-        entry = _safe_float(r["entry"])
-        stop = _safe_float(r["stop_loss"])
-        tp = _safe_float(r["take_profit"])
-
-        symbol = str(r["symbol"]).strip().upper()
-        ref_time = str(r["ref_time"]).strip()
+        entry = _safe_float(r.get("entry", 0))
+        stop = _safe_float(r.get("stop_loss", 0))
+        tp = _safe_float(r.get("take_profit", 0))
 
         if entry <= 0 or stop <= 0 or tp <= 0:
             continue
@@ -156,85 +157,79 @@ def select_trades():
         if risk_per_share <= 0:
             continue
 
-        # baseline shares by risk
+        # sizing: risk-based
         shares_by_risk = math.floor(k["risk_per_trade_usd"] / risk_per_share)
         if shares_by_risk <= 0:
             continue
 
-        # budget cap (max notional per trade)
+        # sizing: budget cap
         shares_by_budget = math.floor(k["max_trade_budget_usd"] / entry)
         if shares_by_budget <= 0:
             continue
 
-        order_qty = int(max(0, min(shares_by_risk, shares_by_budget)))
+        order_qty = int(min(shares_by_risk, shares_by_budget))
         if order_qty <= 0:
             continue
 
         entry_notional = entry * order_qty
         tp_notional = tp * order_qty
 
-        # Cost estimate: round-trip cost rate applied to entry + exit
+        # round-trip cost
         cost_est = k["est_txn_cost_rate"] * (entry_notional + tp_notional)
 
-        # Convert cost into R units
         denom = risk_per_share * order_qty
         cost_in_r = cost_est / denom if denom > 0 else 999.0
 
-        # Net expected R after cost (using target multiple from Control)
         expected_net_r = k["take_profit_r_mult"] - cost_in_r
 
-        # Risk percentage as a mild stabilizer (prefer more capital-efficient trades)
+        # stabilize by % risk (smaller % risk is better, all else equal)
         risk_pct = risk_per_share / entry
         score = expected_net_r / max(risk_pct, 1e-9)
 
         scored_rows.append({
-            "idx": idx,
-            "symbol": symbol,
-            "ref_time": ref_time,
-            "risk_per_share": risk_per_share,
-            "order_qty": order_qty,
-            "notional": entry_notional,
-            "cost_est": cost_est,
-            "cost_in_r": cost_in_r,
-            "expected_net_r": expected_net_r,
-            "score": score,
+            "idx": int(idx),
+            "order_qty": int(order_qty),
+            "notional": float(entry_notional),
+            "risk_per_share": float(risk_per_share),
+            "cost_est": float(cost_est),
+            "cost_in_r": float(cost_in_r),
+            "expected_net_r": float(expected_net_r),
+            "score": float(score),
         })
 
     if not scored_rows:
         msg = "No trades passed sizing/budget filters."
         logger.info(msg)
         ws_logs.append_rows([[utc_iso_z(), "select_trades", "INFO", msg]])
+        # Clear scoring columns anyway (so it’s deterministic)
+        for col in ["cost_est", "cost_in_r", "expected_net_r", "score", "priority_rank", "selected", "order_qty"]:
+            df[col] = "" if col != "selected" else "FALSE"
         df = df[TRADE_HEADERS]
         clear_and_write(ws_trades, TRADE_HEADERS, df)
         return
 
-    scored = pd.DataFrame(scored_rows)
+    scored_all = pd.DataFrame(scored_rows)
 
-    # Filter by minimum net R
-    scored = scored[scored["expected_net_r"] >= k["min_expected_net_r"]].copy()
-    if scored.empty:
-        msg = "All trades filtered out by min_expected_net_r."
-        logger.info(msg)
-        ws_logs.append_rows([[utc_iso_z(), "select_trades", "INFO", msg]])
-        df = df[TRADE_HEADERS]
-        clear_and_write(ws_trades, TRADE_HEADERS, df)
-        return
+    # Rank ALL trades for visibility (even if filtered out later)
+    scored_all = scored_all.sort_values(["score", "expected_net_r"], ascending=[False, False]).reset_index(drop=True)
+    scored_all["priority_rank"] = scored_all.index + 1
 
-    # Rank by score desc
-    scored = scored.sort_values(["score", "expected_net_r"], ascending=[False, False]).reset_index(drop=True)
-    scored["priority_rank"] = scored.index + 1
+    # Selection set: must pass min_expected_net_r
+    scored_sel = scored_all[scored_all["expected_net_r"] >= k["min_expected_net_r"]].copy()
 
-    # Greedy pick within total capital and max concurrent trades
-    selected = []
+    # Greedy selection within total capital + max concurrent
+    selected_idxs = []
     remaining = float(k["total_capital_usd"])
-    for _, sr in scored.iterrows():
-        if len(selected) >= int(k["max_concurrent_trades"]):
-            break
-        if sr["notional"] <= remaining:
-            selected.append(int(sr["idx"]))
-            remaining -= float(sr["notional"])
 
-    # Apply results back to df
+    if not scored_sel.empty and k["auto_select"]:
+        for _, sr in scored_sel.iterrows():
+            if len(selected_idxs) >= int(k["max_concurrent_trades"]):
+                break
+            if float(sr["notional"]) <= remaining:
+                selected_idxs.append(int(sr["idx"]))
+                remaining -= float(sr["notional"])
+
+    # Reset columns for all rows first (deterministic)
     df["selected"] = "FALSE"
     df["priority_rank"] = ""
     df["order_qty"] = ""
@@ -243,8 +238,8 @@ def select_trades():
     df["expected_net_r"] = ""
     df["score"] = ""
 
-    # Write scored values for NEW trades
-    for _, sr in scored.iterrows():
+    # Write computed values back (for NEW trades that were scored)
+    for _, sr in scored_all.iterrows():
         irow = int(sr["idx"])
         df.at[irow, "risk_per_share"] = round(float(sr["risk_per_share"]), 4)
         df.at[irow, "order_qty"] = int(sr["order_qty"])
@@ -255,16 +250,14 @@ def select_trades():
         df.at[irow, "score"] = round(float(sr["score"]), 4)
         df.at[irow, "priority_rank"] = int(sr["priority_rank"])
 
-    if k["auto_select"]:
-        for idx in selected:
-            df.at[idx, "selected"] = "TRUE"
+    for irow in selected_idxs:
+        df.at[irow, "selected"] = "TRUE"
 
-    msg = f"Scored={len(scored)} Selected={len(selected)} RemainingCapital={round(remaining, 2)}"
+    msg = f"Scored={len(scored_all)} Selected={len(selected_idxs)} RemainingCapital={round(remaining, 2)}"
     logger.info(msg)
     ws_logs.append_rows([[utc_iso_z(), "select_trades", "INFO", msg]])
 
-    # Persist back to sheet (overwrite with updated data)
-    df["timestamp_utc"] = df["timestamp_utc"].astype(str)
+    # Persist back
     df = df[TRADE_HEADERS]
     clear_and_write(ws_trades, TRADE_HEADERS, df)
 
