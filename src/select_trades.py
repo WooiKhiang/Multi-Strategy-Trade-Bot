@@ -6,7 +6,7 @@ import pandas as pd
 
 from .config import Config
 from .logger import get_logger
-from .sheets import open_sheet, ensure_worksheet, read_worksheet_df, clear_and_write
+from .sheets import open_sheet, ensure_worksheet, read_worksheet_df, clear_and_write, append_rows
 
 
 TRADE_HEADERS = [
@@ -31,14 +31,24 @@ TRADE_HEADERS = [
     "note",
 ]
 
+CONTROL_HEADERS = ["key", "value"]
+CAPITAL_HEADERS = [
+    "timestamp_utc",
+    "mode",
+    "endpoint",
+    "cash",
+    "buying_power",
+    "portfolio_value",
+    "equity",
+    "last_equity",
+    "currency",
+    "status",
+]
+LOG_HEADERS = ["timestamp_utc", "component", "level", "message"]
+
 
 def utc_iso_z() -> str:
-    return (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _safe_float(x, default=0.0) -> float:
@@ -54,7 +64,7 @@ def _safe_float(x, default=0.0) -> float:
 
 
 def _read_control_kv(ss) -> dict:
-    ws_control = ensure_worksheet(ss, "Control", ["key", "value"])
+    ws_control = ensure_worksheet(ss, "Control", CONTROL_HEADERS)
     df = read_worksheet_df(ws_control)
     if df is None or df.empty:
         return {}
@@ -81,6 +91,30 @@ def _read_control_kv(ss) -> dict:
     return out
 
 
+def _read_latest_alpaca_cash(ss, logger) -> float | None:
+    """
+    Reads latest row of Capital tab and returns cash as float.
+    Returns None if not available.
+    """
+    ws_capital = ensure_worksheet(ss, "Capital", CAPITAL_HEADERS)
+    df = read_worksheet_df(ws_capital)
+    if df is None or df.empty:
+        return None
+
+    # best-effort: pick last non-empty cash value
+    # (Capital tab is append-only)
+    if "cash" not in df.columns:
+        return None
+
+    # Take last row where cash is parseable
+    for i in range(len(df) - 1, -1, -1):
+        cash = _safe_float(df.iloc[i].get("cash", ""), default=None)
+        if cash is not None and cash > 0:
+            return float(cash)
+
+    return None
+
+
 def _knobs(cfg: Config, control: dict) -> dict:
     def f(key: str, default: float) -> float:
         return _safe_float(control.get(key, default), default)
@@ -92,16 +126,27 @@ def _knobs(cfg: Config, control: dict) -> dict:
             return int(default)
 
     return {
-        "total_capital_usd": f("total_capital_usd", 5000.0),
+        # Your “strategy constraint” capital
+        "strategy_capital_usd": f("strategy_capital_usd", 5000.0),
+
+        # Per-trade budget cap
         "max_trade_budget_usd": f("max_trade_budget_usd", 2000.0),
+
+        # Concurrency cap
         "max_concurrent_trades": i("max_concurrent_trades", 2),
+
+        # Risk model inputs
         "risk_per_trade_usd": f("risk_per_trade_usd", getattr(cfg, "risk_per_trade_usd", 25.0)),
         "take_profit_r_mult": f("take_profit_r_mult", getattr(cfg, "take_profit_r_mult", 2.0)),
-        # IMPORTANT: realistic default (0.05% round-trip). You can override in Control.
+
+        # Cost model (override in Control if you want)
         "est_txn_cost_rate": f("est_txn_cost_rate", 0.0005),
+
+        # Selection filter
         "min_expected_net_r": f("min_expected_net_r", 1.2),
+
+        # auto selection toggle
         "auto_select": str(control.get("auto_select", "TRUE")).strip().upper() in ("TRUE", "YES", "1", "Y"),
-        "mode": str(control.get("mode", "PAPER")).strip().upper(),
     }
 
 
@@ -113,17 +158,27 @@ def select_trades():
         raise RuntimeError("GSHEET_ID missing")
 
     ss = open_sheet(cfg.gsheet_id, cfg.google_service_account_json)
+
     ws_trades = ensure_worksheet(ss, "Trades", TRADE_HEADERS)
-    ws_logs = ensure_worksheet(ss, "Logs", ["timestamp_utc", "component", "level", "message"])
+    ws_logs = ensure_worksheet(ss, "Logs", LOG_HEADERS)
 
     control = _read_control_kv(ss)
     k = _knobs(cfg, control)
+
+    # Pull latest Alpaca cash from Capital tab (synced by sync_alpaca_state.py)
+    alpaca_cash = _read_latest_alpaca_cash(ss, logger)
+
+    # Compute effective capital: never exceed your strategy cap; also never exceed Alpaca cash if available.
+    strategy_cap = float(k["strategy_capital_usd"])
+    effective_capital = strategy_cap
+    if alpaca_cash is not None:
+        effective_capital = min(strategy_cap, float(alpaca_cash))
 
     df = read_worksheet_df(ws_trades)
     if df is None or df.empty:
         msg = "Trades sheet is empty."
         logger.info(msg)
-        ws_logs.append_rows([[utc_iso_z(), "select_trades", "INFO", msg]])
+        append_rows(ws_logs, [[utc_iso_z(), "select_trades", "INFO", msg]])
         return
 
     # Ensure all columns exist in df
@@ -138,7 +193,7 @@ def select_trades():
     if candidates.empty:
         msg = "No NEW trades to select."
         logger.info(msg)
-        ws_logs.append_rows([[utc_iso_z(), "select_trades", "INFO", msg]])
+        append_rows(ws_logs, [[utc_iso_z(), "select_trades", "INFO", msg]])
         df = df[TRADE_HEADERS]
         clear_and_write(ws_trades, TRADE_HEADERS, df)
         return
@@ -158,12 +213,12 @@ def select_trades():
             continue
 
         # sizing: risk-based
-        shares_by_risk = math.floor(k["risk_per_trade_usd"] / risk_per_share)
+        shares_by_risk = math.floor(float(k["risk_per_trade_usd"]) / risk_per_share)
         if shares_by_risk <= 0:
             continue
 
-        # sizing: budget cap
-        shares_by_budget = math.floor(k["max_trade_budget_usd"] / entry)
+        # sizing: per-trade budget cap
+        shares_by_budget = math.floor(float(k["max_trade_budget_usd"]) / entry)
         if shares_by_budget <= 0:
             continue
 
@@ -174,15 +229,15 @@ def select_trades():
         entry_notional = entry * order_qty
         tp_notional = tp * order_qty
 
-        # round-trip cost
-        cost_est = k["est_txn_cost_rate"] * (entry_notional + tp_notional)
+        # round-trip cost estimate
+        cost_est = float(k["est_txn_cost_rate"]) * (entry_notional + tp_notional)
 
         denom = risk_per_share * order_qty
         cost_in_r = cost_est / denom if denom > 0 else 999.0
 
-        expected_net_r = k["take_profit_r_mult"] - cost_in_r
+        expected_net_r = float(k["take_profit_r_mult"]) - cost_in_r
 
-        # stabilize by % risk (smaller % risk is better, all else equal)
+        # mild stabilizer: prefer lower % risk
         risk_pct = risk_per_share / entry
         score = expected_net_r / max(risk_pct, 1e-9)
 
@@ -200,28 +255,29 @@ def select_trades():
     if not scored_rows:
         msg = "No trades passed sizing/budget filters."
         logger.info(msg)
-        ws_logs.append_rows([[utc_iso_z(), "select_trades", "INFO", msg]])
-        # Clear scoring columns anyway (so it’s deterministic)
-        for col in ["cost_est", "cost_in_r", "expected_net_r", "score", "priority_rank", "selected", "order_qty"]:
-            df[col] = "" if col != "selected" else "FALSE"
+        append_rows(ws_logs, [[utc_iso_z(), "select_trades", "INFO", msg]])
+        # Reset selection-related columns deterministically
+        df["selected"] = "FALSE"
+        for col in ["priority_rank", "order_qty", "cost_est", "cost_in_r", "expected_net_r", "score"]:
+            df[col] = ""
         df = df[TRADE_HEADERS]
         clear_and_write(ws_trades, TRADE_HEADERS, df)
         return
 
     scored_all = pd.DataFrame(scored_rows)
 
-    # Rank ALL trades for visibility (even if filtered out later)
+    # Rank ALL scored trades (so you always see score + rank)
     scored_all = scored_all.sort_values(["score", "expected_net_r"], ascending=[False, False]).reset_index(drop=True)
     scored_all["priority_rank"] = scored_all.index + 1
 
-    # Selection set: must pass min_expected_net_r
-    scored_sel = scored_all[scored_all["expected_net_r"] >= k["min_expected_net_r"]].copy()
+    # Selection candidates: pass expected net R filter
+    scored_sel = scored_all[scored_all["expected_net_r"] >= float(k["min_expected_net_r"])].copy()
 
-    # Greedy selection within total capital + max concurrent
-    selected_idxs = []
-    remaining = float(k["total_capital_usd"])
+    # Greedy pick within effective capital and concurrency cap
+    selected_idxs: list[int] = []
+    remaining = float(effective_capital)
 
-    if not scored_sel.empty and k["auto_select"]:
+    if not scored_sel.empty and bool(k["auto_select"]):
         for _, sr in scored_sel.iterrows():
             if len(selected_idxs) >= int(k["max_concurrent_trades"]):
                 break
@@ -229,7 +285,7 @@ def select_trades():
                 selected_idxs.append(int(sr["idx"]))
                 remaining -= float(sr["notional"])
 
-    # Reset columns for all rows first (deterministic)
+    # Reset output columns
     df["selected"] = "FALSE"
     df["priority_rank"] = ""
     df["order_qty"] = ""
@@ -238,7 +294,7 @@ def select_trades():
     df["expected_net_r"] = ""
     df["score"] = ""
 
-    # Write computed values back (for NEW trades that were scored)
+    # Write scored values back for NEW trades that were scored
     for _, sr in scored_all.iterrows():
         irow = int(sr["idx"])
         df.at[irow, "risk_per_share"] = round(float(sr["risk_per_share"]), 4)
@@ -250,12 +306,18 @@ def select_trades():
         df.at[irow, "score"] = round(float(sr["score"]), 4)
         df.at[irow, "priority_rank"] = int(sr["priority_rank"])
 
+    # Apply selection
     for irow in selected_idxs:
         df.at[irow, "selected"] = "TRUE"
 
-    msg = f"Scored={len(scored_all)} Selected={len(selected_idxs)} RemainingCapital={round(remaining, 2)}"
+    msg = (
+        f"strategy_cap={round(strategy_cap,2)} "
+        f"alpaca_cash={(round(alpaca_cash,2) if alpaca_cash is not None else 'NA')} "
+        f"effective_cap={round(effective_capital,2)} "
+        f"Scored={len(scored_all)} Selected={len(selected_idxs)} Remaining={round(remaining,2)}"
+    )
     logger.info(msg)
-    ws_logs.append_rows([[utc_iso_z(), "select_trades", "INFO", msg]])
+    append_rows(ws_logs, [[utc_iso_z(), "select_trades", "INFO", msg]])
 
     # Persist back
     df = df[TRADE_HEADERS]
