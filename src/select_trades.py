@@ -50,6 +50,42 @@ LOG_HEADERS = ["timestamp_utc", "component", "level", "message"]
 def utc_iso_z() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
+def _read_latest_market_regime(ss) -> str:
+    ws = ensure_worksheet(ss, "Market", ["date", "spy_close", "spy_ema20", "spy_ema50", "vix", "regime", "confidence"])
+    df = read_worksheet_df(ws)
+    if df is None or df.empty:
+        return "NEUTRAL"
+    # take last non-empty regime
+    col = None
+    for c in df.columns:
+        if c.strip().lower() == "regime":
+            col = c
+            break
+    if not col:
+        return "NEUTRAL"
+    val = str(df.iloc[-1][col]).strip().upper()
+    return val if val in ("BULL", "NEUTRAL", "DEFENSIVE") else "NEUTRAL"
+
+def _apply_regime_overlay(k: dict, control: dict, regime: str) -> dict:
+    r = regime.lower()
+
+    def f(key: str, default: float) -> float:
+        try:
+            return float(control.get(key, default))
+        except Exception:
+            return float(default)
+
+    def i(key: str, default: int) -> int:
+        try:
+            return int(float(control.get(key, default)))
+        except Exception:
+            return int(default)
+
+    # override knobs using Control tab if present
+    k["risk_per_trade_usd"] = f(f"risk_per_trade_usd_{r}", k["risk_per_trade_usd"])
+    k["max_concurrent_trades"] = i(f"max_concurrent_trades_{r}", k["max_concurrent_trades"])
+    k["take_profit_r_mult"] = f(f"take_profit_r_mult_{r}", k["take_profit_r_mult"])
+    return k
 
 def _safe_float(x, default=0.0) -> float:
     try:
