@@ -42,6 +42,13 @@ jobs:
         run: |
           echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT }}' > service_account.json
 
+      - name: Debug - show main_hourly_scan.py
+        run: |
+          echo "===== src/main_hourly_scan.py (head) ====="
+          sed -n '1,120p' src/main_hourly_scan.py
+          echo "===== grep ws_candidates ====="
+          grep -n "ws_candidates" src/main_hourly_scan.py || true
+
       - name: Run hourly scan
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
@@ -52,6 +59,8 @@ jobs:
           ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
           ALPACA_PAPER: "true"
 
+          # NOTE: your code now reads Universe from Google Sheet,
+          # so UNIVERSE_STATIC_FILE is no longer used (safe to keep though).
           UNIVERSE_STATIC_FILE: ./universe_static.csv
           MAX_UNIVERSE_TICKERS: "1200"
 
