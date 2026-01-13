@@ -29,14 +29,29 @@ def main():
     ss = open_sheet(cfg.gsheet_id, cfg.google_service_account_json)
 
     ws_universe = ensure_worksheet(ss, "Universe", ["symbol"])
-    ws_candidates = ensure_worksheet(ss, "Candidates", CAND_HEADERS)
-    ws_logs = ensure_worksheet(ss, "Logs", ["timestamp_utc", "component", "level", "message"])
 
-    tickers = load_static_universe(cfg.universe_static_file, cfg.max_universe_tickers)
+    u_df = read_worksheet_df(ws_universe)
+    if u_df is None or u_df.empty or "symbol" not in u_df.columns:
+        raise RuntimeError("Universe tab is empty or missing 'symbol' column")
 
-    # Write universe snapshot (overwrite)
-    u_df = pd.DataFrame({"symbol": tickers})
-    clear_and_write(ws_universe, ["symbol"], u_df)
+    tickers = (
+        u_df["symbol"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
+    tickers = [t for t in tickers.tolist() if t and t != "NAN"]
+    # de-dup keep order
+    tickers = list(dict.fromkeys(tickers))
+
+    # optional: cap if you still want
+    if getattr(cfg, "max_universe_tickers", None):
+        try:
+            cap = int(cfg.max_universe_tickers)
+            if cap > 0:
+                tickers = tickers[:cap]
+        except Exception:
+            pass
 
     # Run scan and overwrite candidates (simple + avoids bloat)
     cand_df = run_hourly_scan(tickers, cfg, logger)
