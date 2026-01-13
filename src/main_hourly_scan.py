@@ -48,6 +48,7 @@ def main():
     cand_df = run_hourly_scan(tickers, cfg, logger)
 
     # overwrite candidates each run (clean)
+    ws_candidates = ensure_worksheet(ss, "Candidates", CAND_HEADERS)
     clear_and_write(ws_candidates, CAND_HEADERS, cand_df)
 
     append_rows(
