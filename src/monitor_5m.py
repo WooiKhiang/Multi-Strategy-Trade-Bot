@@ -4,7 +4,7 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Any, Dict
 
 import pandas as pd
 
@@ -33,10 +33,54 @@ CACHE_DIR = "data"
 FIRED_CACHE_FILE = os.path.join(CACHE_DIR, "fired_signals.json")
 
 
-def _utcnow_iso() -> str:
-    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+# ----------------------------
+# Time helpers
+# ----------------------------
+def utc_iso_z() -> str:
+    """UTC timestamp like 2026-01-13T01:38:14Z (no microseconds)."""
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
+def _parse_dt_utc(v):
+    """
+    Parse a sheet datetime value into timezone-aware UTC datetime.
+    Accepts: datetime, ISO strings with Z, normal strings, empty.
+    """
+    if v is None:
+        return None
+
+    if isinstance(v, datetime):
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+
+    s = str(v).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return None
+
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        # fallback: try pandas
+        try:
+            dt = pd.to_datetime(v, utc=True, errors="coerce")
+            if pd.isna(dt):
+                return None
+            return dt.to_pydatetime()
+        except Exception:
+            return None
+
+
+# ----------------------------
+# Fired cache (local JSON)
+# ----------------------------
 def _load_fired_cache() -> Dict[str, Any]:
     os.makedirs(CACHE_DIR, exist_ok=True)
     if not os.path.exists(FIRED_CACHE_FILE):
@@ -76,22 +120,9 @@ def _mark_fired(symbol: str, ref_time: str, cache: Dict[str, Any]) -> None:
     cache["fired"] = fired[-3000:]  # cap growth
 
 
-def _parse_iso(dt_str: str):
-    if not dt_str:
-        return None
-    try:
-        # tolerate trailing Z
-        s = str(dt_str).replace("Z", "+00:00")
-        # fromisoformat handles "2026-01-11T10:00:00+00:00"
-        d = datetime.fromisoformat(s)
-        # make naive UTC for comparisons
-        if d.tzinfo is not None:
-            d = d.astimezone(timezone.utc).replace(tzinfo=None)
-        return d
-    except Exception:
-        return None
-
-
+# ----------------------------
+# Data cleaning
+# ----------------------------
 def _safe_float(x, default=0.0) -> float:
     try:
         return float(x)
@@ -100,6 +131,10 @@ def _safe_float(x, default=0.0) -> float:
 
 
 def _clean_candidates(df: pd.DataFrame, logger) -> pd.DataFrame:
+    """
+    Expect Candidates columns:
+      symbol, ref_time, ref_low, atr, expires_utc, status
+    """
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -113,23 +148,31 @@ def _clean_candidates(df: pd.DataFrame, logger) -> pd.DataFrame:
     df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
     df["status"] = df["status"].astype(str).str.upper().str.strip()
 
-    # active only
-    df = df[df["status"] == "ACTIVE"]
+    # ACTIVE only
+    df = df[df["status"] == "ACTIVE"].copy()
+    if df.empty:
+        return pd.DataFrame()
 
-    # not expired
-    now = datetime.utcnow()
+    # Not expired (expires_utc is string in sheet -> parse to datetime)
     def not_expired(row) -> bool:
-        exp = _parse_iso(str(row.get("expires_utc", "")))
+        exp_raw = row.get("expires_utc")
+        exp = _parse_dt_utc(exp_raw)
         if exp is None:
+            # If missing expiry, keep it (safer than dropping)
             return True
+        now = datetime.now(timezone.utc)
         return exp >= now
 
-    df = df[df.apply(not_expired, axis=1)]
+    df = df[df.apply(not_expired, axis=1)].copy()
 
-    # keep only what we need and de-dup
-    return df[required].drop_duplicates(subset=["symbol", "ref_time"])
+    # keep only required and de-dup
+    df = df[required].drop_duplicates(subset=["symbol", "ref_time"])
+    return df
 
 
+# ----------------------------
+# Main run
+# ----------------------------
 def run_once(cfg: Config, logger) -> int:
     if not cfg.gsheet_id:
         raise RuntimeError("GSHEET_ID missing in env/.env")
@@ -146,13 +189,12 @@ def run_once(cfg: Config, logger) -> int:
     if cand_df.empty:
         msg = "No ACTIVE, non-expired candidates."
         logger.info(msg)
-        ws_logs.append_rows([[_utcnow_iso(), "monitor_5m", "INFO", msg]])
+        ws_logs.append_rows([[utc_iso_z(), "monitor_5m", "INFO", msg]])
         return 0
 
     tickers = cand_df["symbol"].tolist()
     logger.info(f"Monitoring 5m confirmations for {len(tickers)} tickers.")
 
-    # Load duplicate protection cache (local json)
     cache = _load_fired_cache()
 
     # Download 5m bars (NO SQLITE CACHE)
@@ -163,8 +205,8 @@ def run_once(cfg: Config, logger) -> int:
         batch_size=min(getattr(cfg, "yf_batch_size", 50), 50),
         sleep_sec=float(getattr(cfg, "yf_sleep_between_batch_sec", 2)),
         logger=logger,
-        cache_key_prefix="yf5m",
-        use_cache=False,   # IMPORTANT: avoid any DB cache behavior
+        cache_key_prefix=None,
+        use_cache=False,
     )
 
     signal_rows = []
@@ -201,7 +243,7 @@ def run_once(cfg: Config, logger) -> int:
         fired_now += 1
 
         signal_rows.append({
-            "timestamp_utc": _utcnow_iso(),
+            "timestamp_utc": utc_iso_z(),
             "symbol": sym,
             "ref_time": ref_time,
             "ref_low": ref_low,
@@ -221,12 +263,12 @@ def run_once(cfg: Config, logger) -> int:
         append_df(ws_signals, out_df, SIGNAL_HEADERS)
         msg = f"Signals appended={len(out_df)} (new fired={fired_now})"
         logger.info(msg)
-        ws_logs.append_rows([[_utcnow_iso(), "monitor_5m", "INFO", msg]])
+        ws_logs.append_rows([[utc_iso_z(), "monitor_5m", "INFO", msg]])
         return len(out_df)
 
     msg = "No confirmations this tick."
     logger.info(msg)
-    ws_logs.append_rows([[_utcnow_iso(), "monitor_5m", "INFO", msg]])
+    ws_logs.append_rows([[utc_iso_z(), "monitor_5m", "INFO", msg]])
     return 0
 
 
