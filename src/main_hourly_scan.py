@@ -29,8 +29,13 @@ def main():
     ss = open_sheet(cfg.gsheet_id, cfg.google_service_account_json)
 
     ws_universe = ensure_worksheet(ss, "Universe", ["symbol"])
-    ws_candidates = ensure_worksheet(ss, "Candidates", CAND_HEADERS)
-    ws_logs = ensure_worksheet(ss, "Logs", ["timestamp_utc", "component", "level", "message"])
+
+    # ✅ CHANGED: write momentum candidates here
+    ws_candidates_momentum = ensure_worksheet(ss, "Candidates_Momentum", CAND_HEADERS)
+
+    ws_logs = ensure_worksheet(
+        ss, "Logs", ["timestamp_utc", "component", "level", "message"]
+    )
 
     tickers = load_static_universe(cfg.universe_static_file, cfg.max_universe_tickers)
 
@@ -38,9 +43,9 @@ def main():
     u_df = pd.DataFrame({"symbol": tickers})
     clear_and_write(ws_universe, ["symbol"], u_df)
 
-    # Run scan and overwrite candidates (simple + avoids bloat)
+    # Run scan and overwrite momentum candidates (simple + avoids bloat)
     cand_df = run_hourly_scan(tickers, cfg, logger)
-    clear_and_write(ws_candidates, CAND_HEADERS, cand_df)
+    clear_and_write(ws_candidates_momentum, CAND_HEADERS, cand_df)
 
     # Always write a clean standardized timestamp to Logs
     append_rows(
@@ -49,7 +54,7 @@ def main():
             utc_iso_z(),
             "hourly_scan",
             "INFO",
-            f"Universe={len(tickers)} Candidates={len(cand_df)}",
+            f"Universe={len(tickers)} MomentumCandidates={len(cand_df)}",
         ]],
     )
 
