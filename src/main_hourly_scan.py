@@ -6,9 +6,23 @@ import pandas as pd
 from .config import Config
 from .logger import get_logger
 from .universe import load_static_universe
-from .scan_1h import run_hourly_scan, CAND_HEADERS
+from .scan_1h import run_hourly_scan
 from .sheets import open_sheet, ensure_worksheet, clear_and_write, append_rows
 
+CAND_HEADERS = [
+    "candidate_id",
+    "symbol",
+    "strategy",
+    "timeframe",
+    "trigger_reason",
+    "source",
+    "ref_price",
+    "generated_at_ny",
+    "expires_at_ny",
+    "status",
+    "params_json",
+    "notes",
+]
 
 def utc_iso_z() -> str:
     return (
